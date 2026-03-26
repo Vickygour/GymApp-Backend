@@ -15,13 +15,13 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+// PORT: Railway apna port khud deta hai, isliye process.env.PORT zaroori hai
+const PORT = process.env.PORT || 5000;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+
 // --- 1. MONGODB CONNECTION ---
 mongoose
-  .connect(process.env.MONGO_URI!, {
-    // @ts-ignore
-    tls: true,
-    tlsAllowInvalidCertificates: true,
-  })
+  .connect(process.env.MONGO_URI!)
   .then(() => console.log('✅ MongoDB Connected'))
   .catch((err) => console.error('❌ MongoDB Error:', err));
 
@@ -41,13 +41,14 @@ const User = mongoose.model('User', userSchema);
 // --- 3. SESSION & CORS ---
 app.use(
   cors({
-    origin: [
-      'http://localhost:3000',
-      'http://192.168.1.4:3000', // Phone wala URL bhi allow karo
-    ],
+    origin: [FRONTEND_URL, 'http://localhost:3000'], // Dono allow rakhein testing ke liye
     credentials: true,
   }),
 );
+
+// Trust Proxy: Railway/Heroku jaise platforms ke liye zaroori hai
+app.set('trust proxy', 1);
+
 app.use(
   session({
     secret: process.env.SESSION_SECRET!,
@@ -56,7 +57,9 @@ app.use(
     store: MongoStore.create({ mongoUrl: process.env.MONGO_URI! }),
     cookie: {
       maxAge: 24 * 60 * 60 * 1000,
-      secure: false,
+      // Production mein secure true hota hai agar HTTPS hai, local par false
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       httpOnly: true,
     },
   }),
@@ -67,29 +70,26 @@ app.use(passport.session());
 
 // --- 4. PASSPORT CONFIG ---
 
-// 4.1 GOOGLE STRATEGY (Ye missing tha!)
 passport.use(
   new GoogleStrategy(
     {
       clientID: process.env.GOOGLE_CLIENT_ID!,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
-      callbackURL: process.env.GOOGLE_CALLBACK_URL || '/auth/google/callback',
+      callbackURL: process.env.GOOGLE_CALLBACK_URL, // Railway ka URL .env se aayega
+      proxy: true, // Zaroori hai taaki HTTPS sahi se kaam kare
     },
     async (accessToken, refreshToken, profile, done) => {
       try {
         let user = await User.findOne({ email: profile.emails?.[0].value });
-
         if (!user) {
-          // Naya user banao agar nahi hai
           user = await User.create({
             googleId: profile.id,
             displayName: profile.displayName,
             email: profile.emails?.[0].value,
             image: profile.photos?.[0].value,
-            isVerified: true, // Google users are pre-verified
+            isVerified: true,
           });
         } else if (!user.googleId) {
-          // Agar email se account hai par Google link nahi hai
           user.googleId = profile.id;
           user.isVerified = true;
           await user.save();
@@ -102,7 +102,6 @@ passport.use(
   ),
 );
 
-// 4.2 LOCAL STRATEGY
 passport.use(
   new LocalStrategy(
     { usernameField: 'email' },
@@ -111,7 +110,7 @@ passport.use(
         const user = await User.findOne({ email });
         if (!user) return done(null, false, { message: 'User not found.' });
         if (!user.isVerified)
-          return done(null, false, { message: 'Please verify OTP first.' });
+          return done(null, false, { message: 'Verify OTP first.' });
         if (!user.password)
           return done(null, false, { message: 'Use Google Login.' });
 
@@ -134,17 +133,15 @@ passport.deserializeUser(async (id, done) => {
 
 // --- 5. ROUTES ---
 
-// SIGNUP
+// OTP SIGNUP & VERIFY (Same as before)
 app.post('/auth/signup', async (req: Request, res: Response) => {
   const { displayName, email, password } = req.body;
   try {
     const existingUser = await User.findOne({ email, isVerified: true });
     if (existingUser)
       return res.status(400).json({ message: 'Email already registered' });
-
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const hashedPassword = await bcrypt.hash(password, 10);
-
     await User.findOneAndUpdate(
       { email },
       {
@@ -154,28 +151,24 @@ app.post('/auth/signup', async (req: Request, res: Response) => {
         otpExpires: Date.now() + 600000,
         isVerified: false,
       },
-      { upsert: true, returnDocument: 'after' },
+      { upsert: true },
     );
-
     const transporter = nodemailer.createTransport({
       service: 'gmail',
       auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
     });
-
     await transporter.sendMail({
       from: `"ProFit Support" <${process.env.EMAIL_USER}>`,
       to: email,
       subject: 'Verify Your Account',
       html: `<h2>OTP: ${otp}</h2>`,
     });
-
     res.status(200).json({ message: 'OTP sent!' });
   } catch (err) {
     res.status(500).json({ message: 'Error' });
   }
 });
 
-// VERIFY OTP
 app.post('/auth/verify-otp', async (req: Request, res: Response) => {
   const { email, otp } = req.body;
   try {
@@ -185,7 +178,6 @@ app.post('/auth/verify-otp', async (req: Request, res: Response) => {
       otpExpires: { $gt: new Date() },
     });
     if (!user) return res.status(400).json({ message: 'Invalid OTP' });
-
     user.isVerified = true;
     user.otp = undefined;
     await user.save();
@@ -195,7 +187,6 @@ app.post('/auth/verify-otp', async (req: Request, res: Response) => {
   }
 });
 
-// LOGIN
 app.post('/auth/login', (req: Request, res: Response, next: NextFunction) => {
   passport.authenticate('local', (err: any, user: any, info: any) => {
     if (err) return next(err);
@@ -208,7 +199,7 @@ app.post('/auth/login', (req: Request, res: Response, next: NextFunction) => {
   })(req, res, next);
 });
 
-// GOOGLE AUTH ROUTES
+// --- GOOGLE AUTH PRODUCTION REDIRECTS ---
 app.get(
   '/auth/google',
   passport.authenticate('google', { scope: ['profile', 'email'] }),
@@ -216,14 +207,14 @@ app.get(
 
 app.get(
   '/auth/google/callback',
-  passport.authenticate('google', {
-    failureRedirect: 'http://localhost:3000/auth',
-  }),
+  passport.authenticate('google', { failureRedirect: `${FRONTEND_URL}/auth` }),
   (req, res) => {
-    res.redirect('http://localhost:3000/home');
+    // Railway par deploy hone ke baad FRONTEND_URL par redirect karega
+    res.redirect(`${FRONTEND_URL}/home`);
   },
 );
 
-app.listen(5000, () =>
-  console.log('🚀 Server running on http://localhost:5000'),
-);
+// Health Check Route (Railway verification ke liye)
+app.get('/', (req, res) => res.send('Gym App Backend is Live!'));
+
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
