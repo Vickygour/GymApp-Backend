@@ -167,9 +167,17 @@ app.post('/auth/signup', async (req: Request, res: Response) => {
       { upsert: true },
     );
 
+    // Naya aur Stable Transporter
     const transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true, // Port 465 ke liye true hona chahiye
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS,
+      },
+      // Connection timeout badhane ke liye (Railway ke liye)
+      connectionTimeout: 10000,
     });
 
     await transporter.sendMail({
