@@ -13,19 +13,35 @@ import nodemailer from 'nodemailer';
 dotenv.config();
 
 const app = express();
+
+// --- 1. SETTINGS & MIDDLEWARES ---
+const PORT = process.env.PORT || 5000;
+// Frontend URL se last wala '/' hata dena agar .env mein ho
+const FRONTEND_URL = process.env.FRONTEND_URL
+  ? process.env.FRONTEND_URL.replace(/\/$/, '')
+  : 'http://localhost:3000';
+
 app.use(express.json());
 
-// PORT: Railway apna port khud deta hai, isliye process.env.PORT zaroori hai
-const PORT = process.env.PORT || 5000;
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+// Trust Proxy: Railway/HTTPS ke liye bahut zaroori hai
+app.set('trust proxy', 1);
 
-// --- 1. MONGODB CONNECTION ---
+app.use(
+  cors({
+    origin: [FRONTEND_URL, 'http://localhost:3000', 'http://192.168.1.4:3000'],
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  }),
+);
+
+// --- 2. MONGODB CONNECTION ---
 mongoose
   .connect(process.env.MONGO_URI!)
   .then(() => console.log('✅ MongoDB Connected'))
   .catch((err) => console.error('❌ MongoDB Error:', err));
 
-// --- 2. USER MODEL ---
+// --- 3. USER MODEL ---
 const userSchema = new mongoose.Schema({
   displayName: { type: String, required: true },
   email: { type: String, unique: true, required: true },
@@ -38,17 +54,7 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model('User', userSchema);
 
-// --- 3. SESSION & CORS ---
-app.use(
-  cors({
-    origin: [FRONTEND_URL, 'http://localhost:3000'], // Dono allow rakhein testing ke liye
-    credentials: true,
-  }),
-);
-
-// Trust Proxy: Railway/Heroku jaise platforms ke liye zaroori hai
-app.set('trust proxy', 1);
-
+// --- 4. SESSION CONFIG ---
 app.use(
   session({
     secret: process.env.SESSION_SECRET!,
@@ -57,7 +63,7 @@ app.use(
     store: MongoStore.create({ mongoUrl: process.env.MONGO_URI! }),
     cookie: {
       maxAge: 24 * 60 * 60 * 1000,
-      // Production mein secure true hota hai agar HTTPS hai, local par false
+      // Production mein HTTPS zaroori hai
       secure: process.env.NODE_ENV === 'production',
       sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
       httpOnly: true,
@@ -68,15 +74,16 @@ app.use(
 app.use(passport.initialize());
 app.use(passport.session());
 
-// --- 4. PASSPORT CONFIG ---
+// --- 5. PASSPORT STRATEGIES ---
 
+// GOOGLE STRATEGY
 passport.use(
   new GoogleStrategy(
     {
       clientID: process.env.GOOGLE_CLIENT_ID!,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
-      callbackURL: process.env.GOOGLE_CALLBACK_URL, // Railway ka URL .env se aayega
-      proxy: true, // Zaroori hai taaki HTTPS sahi se kaam kare
+      callbackURL: process.env.GOOGLE_CALLBACK_URL,
+      proxy: true,
     },
     async (accessToken, refreshToken, profile, done) => {
       try {
@@ -102,6 +109,7 @@ passport.use(
   ),
 );
 
+// LOCAL STRATEGY
 passport.use(
   new LocalStrategy(
     { usernameField: 'email' },
@@ -127,48 +135,63 @@ passport.use(
 
 passport.serializeUser((user: any, done) => done(null, user.id));
 passport.deserializeUser(async (id, done) => {
-  const user = await User.findById(id);
-  done(null, user);
+  try {
+    const user = await User.findById(id);
+    done(null, user);
+  } catch (err) {
+    done(err);
+  }
 });
 
-// --- 5. ROUTES ---
+// --- 6. ROUTES ---
 
-// OTP SIGNUP & VERIFY (Same as before)
+// Health Check
+app.get('/', (req, res) => res.send('Gym App Backend is Live!'));
+
+// SIGNUP (OTP SEND)
 app.post('/auth/signup', async (req: Request, res: Response) => {
   const { displayName, email, password } = req.body;
   try {
-    const existingUser = await User.findOne({ email, isVerified: true });
-    if (existingUser)
-      return res.status(400).json({ message: 'Email already registered' });
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
     const hashedPassword = await bcrypt.hash(password, 10);
+
     await User.findOneAndUpdate(
       { email },
       {
         displayName,
         password: hashedPassword,
         otp,
-        otpExpires: Date.now() + 600000,
+        otpExpires: new Date(Date.now() + 600000),
         isVerified: false,
       },
       { upsert: true },
     );
+
     const transporter = nodemailer.createTransport({
       service: 'gmail',
       auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
     });
+
     await transporter.sendMail({
       from: `"ProFit Support" <${process.env.EMAIL_USER}>`,
       to: email,
       subject: 'Verify Your Account',
-      html: `<h2>OTP: ${otp}</h2>`,
+      html: `<div style="font-family: Arial, sans-serif; padding: 20px;">
+              <h2>Welcome to ProFit!</h2>
+              <p>Your OTP for account verification is:</p>
+              <h1 style="color: #155DFC; letter-spacing: 5px;">${otp}</h1>
+              <p>This OTP is valid for 10 minutes.</p>
+            </div>`,
     });
+
     res.status(200).json({ message: 'OTP sent!' });
   } catch (err) {
-    res.status(500).json({ message: 'Error' });
+    console.error('Signup Error:', err);
+    res.status(500).json({ message: 'Error sending OTP' });
   }
 });
 
+// VERIFY OTP
 app.post('/auth/verify-otp', async (req: Request, res: Response) => {
   const { email, otp } = req.body;
   try {
@@ -177,16 +200,20 @@ app.post('/auth/verify-otp', async (req: Request, res: Response) => {
       otp,
       otpExpires: { $gt: new Date() },
     });
-    if (!user) return res.status(400).json({ message: 'Invalid OTP' });
+    if (!user)
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
+
     user.isVerified = true;
     user.otp = undefined;
+    user.otpExpires = undefined;
     await user.save();
     res.json({ message: 'Verified!' });
   } catch (err) {
-    res.status(500).json({ message: 'Failed' });
+    res.status(500).json({ message: 'Verification failed' });
   }
 });
 
+// LOGIN
 app.post('/auth/login', (req: Request, res: Response, next: NextFunction) => {
   passport.authenticate('local', (err: any, user: any, info: any) => {
     if (err) return next(err);
@@ -199,7 +226,7 @@ app.post('/auth/login', (req: Request, res: Response, next: NextFunction) => {
   })(req, res, next);
 });
 
-// --- GOOGLE AUTH PRODUCTION REDIRECTS ---
+// GOOGLE AUTH
 app.get(
   '/auth/google',
   passport.authenticate('google', { scope: ['profile', 'email'] }),
@@ -207,14 +234,18 @@ app.get(
 
 app.get(
   '/auth/google/callback',
-  passport.authenticate('google', { failureRedirect: `${FRONTEND_URL}/auth` }),
+  passport.authenticate('google', { failureRedirect: `${FRONTEND_URL}/login` }),
   (req, res) => {
-    // Railway par deploy hone ke baad FRONTEND_URL par redirect karega
     res.redirect(`${FRONTEND_URL}/home`);
   },
 );
 
-// Health Check Route (Railway verification ke liye)
-app.get('/', (req, res) => res.send('Gym App Backend is Live!'));
+// LOGOUT
+app.get('/auth/logout', (req, res, next) => {
+  req.logout((err) => {
+    if (err) return next(err);
+    res.json({ message: 'Logged out' });
+  });
+});
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
