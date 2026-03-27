@@ -168,23 +168,23 @@ app.post('/auth/signup', async (req: Request, res: Response) => {
     );
 
     // Naya aur Stable Transporter
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 587,
-      secure: false,
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS,
-      },
-      // Ye block Railway ki ENETUNREACH error ko fix karega
-      connectionTimeout: 15000,
-      greetingTimeout: 15000,
-      socketTimeout: 20000,
-      dnsVapi: true, // DNS resolution force karne ke liye
-      options: {
-        family: 4, // Sirf IPv4 use karne ke liye, IPv6 skip karega
-      },
-    } as any); // Type assertion for family option
+  const transporter = nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false,
+    auth: {
+      user: process.env.EMAIL_USER,
+      pass: process.env.EMAIL_PASS,
+    },
+    // Ye settings Railway/Cloud IPv6 issue fix karengi
+    connectionTimeout: 20000,
+    greetingTimeout: 20000,
+    family: 4, // Force IPv4 (Isse ENETUNREACH error solve hogi)
+    tls: {
+      rejectUnauthorized: false,
+      minVersion: 'TLSv1.2',
+    },
+  } as any);
 
     await transporter.sendMail({
       from: `"ProFit Support" <${process.env.EMAIL_USER}>`,
